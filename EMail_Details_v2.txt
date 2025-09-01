@@ -1,6 +1,6 @@
 # Email analysis for "inbox_copy" on a date:
 # - Total count + hourly breakdown
-# - Details (From/To), sorted by time
+# - Details (From/To), sorted by time in tabular format
 # - "To-only" view for a chosen address (no Cc/Bcc)
 # - Ack check: did we send ANY email to the inbound sender later the same day? (To-only, no Cc/Bcc)
 # - Final Totals: Total emails, Total with 'me' in To (any + To-only), Acknowledged, Original vs Replies
@@ -255,6 +255,82 @@ function Test-IsReplySubject {
     return ($Subject -match '^\s*(RE|FW|FWD)\s*:')
 }
 
+# Function to truncate strings for table display
+function Truncate-String {
+    param(
+        [string]$String,
+        [int]$MaxLength = 50
+    )
+    if ([string]::IsNullOrWhiteSpace($String)) { return "" }
+    if ($String.Length -le $MaxLength) { return $String }
+    return $String.Substring(0, $MaxLength - 3) + "..."
+}
+
+# Function to display emails in tabular format
+function Show-EmailTable {
+    param(
+        [Parameter(Mandatory=$true)] [array]$Emails,
+        [string]$Title = "EMAIL DETAILS",
+        [bool]$ShowAck = $false,
+        [array]$SentCache = @()
+    )
+    
+    Write-Host "`n=== $Title ===" -ForegroundColor Green
+    
+    if ($Emails.Count -eq 0) {
+        Write-Host "No emails to display." -ForegroundColor Yellow
+        return
+    }
+    
+    # Create table data
+    $tableData = @()
+    foreach ($email in $Emails) {
+        $receivedTime = [datetime]::Parse($email.receivedDateTime).ToString("HH:mm:ss")
+        
+        # From
+        $fromDisplay = "<unknown>"
+        if ($email.from -and $email.from.emailAddress) {
+            $fromName = $email.from.emailAddress.name
+            $fromAddr = $email.from.emailAddress.address
+            $fromDisplay = if ($fromName) { "$fromName" } else { "$fromAddr" }
+        }
+        
+        # To recipients count
+        $toCount = if ($email.toRecipients) { $email.toRecipients.Count } else { 0 }
+        $ccCount = if ($email.ccRecipients) { $email.ccRecipients.Count } else { 0 }
+        $bccCount = if ($email.bccRecipients) { $email.bccRecipients.Count } else { 0 }
+        
+        # Recipients summary
+        $recipientsSummary = "To:$toCount"
+        if ($ccCount -gt 0) { $recipientsSummary += " Cc:$ccCount" }
+        if ($bccCount -gt 0) { $recipientsSummary += " Bcc:$bccCount" }
+        
+        # ACK status
+        $ackStatus = "N/A"
+        if ($ShowAck -and $SentCache -and $SentCache.Count -gt 0) {
+            $ack = Find-AckForInboundSameDay -InboundEmail $email -SentCache $SentCache
+            $ackStatus = if ($ack.Acknowledged) { "YES" } else { "NO" }
+        }
+        
+        $row = [PSCustomObject]@{
+            Time = $receivedTime
+            From = Truncate-String -String $fromDisplay -MaxLength 30
+            Recipients = $recipientsSummary
+            Subject = Truncate-String -String $email.subject -MaxLength 50
+            Ack = $ackStatus
+        }
+        
+        $tableData += $row
+    }
+    
+    # Display table
+    if ($ShowAck) {
+        $tableData | Format-Table -Property Time, From, Recipients, Subject, Ack -AutoSize
+    } else {
+        $tableData | Format-Table -Property Time, From, Recipients, Subject -AutoSize
+    }
+}
+
 # ---- MAIN ----
 Write-Host "=== Email Analysis & Ack Checker (inbox_copy) ===" -ForegroundColor Cyan
 
@@ -321,26 +397,66 @@ try {
     $emailsToOnly = @()
     $emailsToAlsoCcOrBcc = @()
     $emailsToAny = @()
+    
     if ($allEmails -and $allEmails.Count -gt 0) {
+        # Debug output for filtering analysis
+        Write-Host "`n=== DEBUG: Email Filtering Analysis ===" -ForegroundColor Magenta
+        Write-Host "Analyzing each email for recipient filtering..." -ForegroundColor Gray
+        Write-Host ""
+        
+        foreach ($email in $allEmails) {
+            $hasTo = Test-RecipientContains -Recipients $email.toRecipients -Address $PrimaryRecipient
+            $ccCount = if ($email.ccRecipients) { $email.ccRecipients.Count } else { 0 }
+            $bccCount = if ($email.bccRecipients) { $email.bccRecipients.Count } else { 0 }
+            $toCount = if ($email.toRecipients) { $email.toRecipients.Count } else { 0 }
+            
+            # Get sender for display
+            $fromAddr = "<unknown>"
+            if ($email.from -and $email.from.emailAddress) {
+                $fromAddr = $email.from.emailAddress.address
+            }
+            
+            Write-Host "From: $fromAddr" -ForegroundColor Cyan
+            Write-Host "  Subject: $(Truncate-String -String $email.subject -MaxLength 60)" -ForegroundColor White
+            Write-Host "  Has '$PrimaryRecipient' in To: $hasTo" -ForegroundColor $(if ($hasTo) {"Green"} else {"Gray"})
+            Write-Host "  To recipients count: $toCount, CC count: $ccCount, BCC count: $bccCount" -ForegroundColor Gray
+            
+            # Check if this should be To-only
+            if ($hasTo -and $ccCount -eq 0 -and $bccCount -eq 0) {
+                Write-Host "  --> Should be To-only: YES" -ForegroundColor Green
+            } else {
+                Write-Host "  --> Should be To-only: NO" -ForegroundColor Yellow
+            }
+            Write-Host ""
+        }
+        
+        # Apply filtering
         $emailsToAny = $allEmails | Where-Object {
             Test-RecipientContains -Recipients $_.toRecipients -Address $PrimaryRecipient
         }
+        
+        # Fixed To-only filter - ensure we're properly checking for empty CC/BCC
         $emailsToOnly = $allEmails | Where-Object {
-            (Test-RecipientContains -Recipients $_.toRecipients -Address $PrimaryRecipient) -and
-            (-not $_.ccRecipients -or $_.ccRecipients.Count -eq 0) -and
-            (-not $_.bccRecipients -or $_.bccRecipients.Count -eq 0)
+            $hasTo = Test-RecipientContains -Recipients $_.toRecipients -Address $PrimaryRecipient
+            $ccEmpty = (-not $_.ccRecipients) -or ($_.ccRecipients.Count -eq 0)
+            $bccEmpty = (-not $_.bccRecipients) -or ($_.bccRecipients.Count -eq 0)
+            
+            $hasTo -and $ccEmpty -and $bccEmpty
         }
+        
         $emailsToAlsoCcOrBcc = $allEmails | Where-Object {
             (Test-RecipientContains -Recipients $_.toRecipients -Address $PrimaryRecipient) -and
             ( ($_.ccRecipients -and $_.ccRecipients.Count -gt 0) -or ($_.bccRecipients -and $_.bccRecipients.Count -gt 0) )
         }
 
-        Write-Host ("To-any for {0}: {1}" -f $PrimaryRecipient, $emailsToAny.Count) -ForegroundColor Yellow
-        Write-Host ("  …of which To-only (no CC/BCC): {0}" -f $emailsToOnly.Count) -ForegroundColor Yellow
-        Write-Host ("To (with CC/BCC present) for {0}: {1}" -f $PrimaryRecipient, $emailsToAlsoCcOrBcc.Count) -ForegroundColor White
+        Write-Host "`n=== FILTERING SUMMARY ===" -ForegroundColor Green
+        Write-Host ("Total emails: {0}" -f $allEmails.Count) -ForegroundColor Yellow
+        Write-Host ("To-any for '{0}': {1}" -f $PrimaryRecipient, $emailsToAny.Count) -ForegroundColor Yellow
+        Write-Host ("  …of which To-only (no CC/BCC): {0}" -f $emailsToOnly.Count) -ForegroundColor Green
+        Write-Host ("  …of which To with CC/BCC present: {0}" -f $emailsToAlsoCcOrBcc.Count) -ForegroundColor White
     }
 
-    # DETAILS + ACK (most recent 50)
+    # DETAILS + ACK
     $sentCache = @()
     if ($ShowDetails -match '^[Yy]' -and $allEmails -and $allEmails.Count -gt 0) {
 
@@ -351,108 +467,29 @@ try {
             Write-Host ("Found {0} sent emails on {1}." -f $sentCache.Count, $CheckDate.ToString('yyyy-MM-dd')) -ForegroundColor White
         }
 
-        Write-Host "`n=== EMAIL DETAILS (Most Recent 50) ===" -ForegroundColor Green
+        # Show all emails in table format
         $recentEmails = $allEmails | Sort-Object { [datetime]::Parse($_.receivedDateTime) } -Descending | Select-Object -First 50
+        Show-EmailTable -Emails $recentEmails -Title "ALL EMAILS (Most Recent 50)" -ShowAck ($CheckAcks -match '^[Yy]') -SentCache $sentCache
 
-        $ackYes = 0; $ackNo = 0
-        foreach ($email in $recentEmails) {
-            $receivedLocal = [datetime]::Parse($email.receivedDateTime).ToString("HH:mm:ss")
-
-            # From
-            $fromEmail = $null
-            $fromLine = "<unknown>"
-            if ($email.from -and $email.from.emailAddress) {
-                $fn = $email.from.emailAddress.name
-                $fe = $email.from.emailAddress.address
-                $fromEmail = $fe
-                $fromLine = if ($fn) { "$fn <$fe>" } else { "$fe" }
-            }
-
-            # To (inbound)
-            $toList = @()
-            if ($email.toRecipients) {
-                $toList = $email.toRecipients | ForEach-Object {
-                    if ($_.emailAddress) {
-                        $n = $_.emailAddress.name
-                        $a = $_.emailAddress.address
-                        if ($n) { "$n <$a>" } else { "$a" }
-                    }
-                }
-            }
-            $toJoined = if ($toList.Count -gt 0) { ($toList -join '; ') } else { "<none>" }
-
-            Write-Host "[$receivedLocal] From: $fromLine" -ForegroundColor Cyan
-            Write-Host "            To:   $toJoined" -ForegroundColor Cyan
-            Write-Host "    Subject: $($email.subject)" -ForegroundColor White
-
-            if ($CheckAcks -match '^[Yy]') {
-                if ($fromEmail -and $sentCache -and $sentCache.Count -gt 0) {
-                    $ack = Find-AckForInboundSameDay -InboundEmail $email -SentCache $sentCache
-                    if ($ack.Acknowledged) {
-                        $ackYes++
-                        $sentLocal = [datetime]::Parse($ack.Message.sentDateTime).ToString("HH:mm:ss")
-                        Write-Host ("    Ack: YES  (sent {0})  Subject: {1}" -f $sentLocal, $ack.Message.subject) -ForegroundColor Green
-                    } else {
-                        $ackNo++
-                        Write-Host "    Ack: NO" -ForegroundColor Yellow
-                    }
-                } else {
-                    $ackNo++
-                    Write-Host "    Ack: NO (missing inbound From or empty Sent cache)" -ForegroundColor Yellow
-                }
-            }
-            Write-Host ""
-        }
-
-        if ($CheckAcks -match '^[Yy]') {
-            Write-Host "=== ACK SUMMARY (Most Recent 50) ===" -ForegroundColor Green
-            Write-Host ("Acknowledged: {0}" -f $ackYes) -ForegroundColor Green
-            Write-Host ("Not acknowledged: {0}" -f $ackNo) -ForegroundColor Yellow
-        }
-
-        # TO-ONLY DETAILS for $PrimaryRecipient (No Cc/Bcc)
+        # Show To-only emails in table format
         if ($emailsToOnly -and $emailsToOnly.Count -gt 0) {
-            Write-Host ("`n=== EMAILS WHERE '{0}' IS IN TO (NO CC/BCC) — Most Recent 50 ===" -f $PrimaryRecipient) -ForegroundColor Green
             $recentToOnly = $emailsToOnly | Sort-Object { [datetime]::Parse($_.receivedDateTime) } -Descending | Select-Object -First 50
-            foreach ($email in $recentToOnly) {
-                $receivedTime = [datetime]::Parse($email.receivedDateTime).ToString("HH:mm:ss")
-
-                $fromAddr = "<unknown>"; $fromEmail = $null
-                if ($email.from -and $email.from.emailAddress) {
-                    $fromName = $email.from.emailAddress.name
-                    $fromEmail = $email.from.emailAddress.address
-                    $fromAddr = if ($fromName) { "$fromName <$fromEmail>" } else { "$fromEmail" }
-                }
-
-                $toList2 = @()
-                if ($email.toRecipients) {
-                    $toList2 = $email.toRecipients | ForEach-Object {
-                        if ($_.emailAddress) {
-                            $n = $_.emailAddress.name
-                            $a = $_.emailAddress.address
-                            if ($n) { "$n <$a>" } else { "$a" }
-                        }
-                    }
-                }
-                $toJoined2 = if ($toList2.Count -gt 0) { ($toList2 -join '; ') } else { "<none>" }
-
-                Write-Host "[$receivedTime] From: $fromAddr" -ForegroundColor Cyan
-                Write-Host "            To:   $toJoined2" -ForegroundColor Cyan
-                Write-Host "    Subject: $($email.subject)" -ForegroundColor White
-
-                if ($CheckAcks -match '^[Yy]' -and $fromEmail -and $sentCache -and $sentCache.Count -gt 0) {
-                    $ack = Find-AckForInboundSameDay -InboundEmail $email -SentCache $sentCache
-                    if ($ack.Acknowledged) {
-                        $sentLocal = [datetime]::Parse($ack.Message.sentDateTime).ToString("HH:mm:ss")
-                        Write-Host ("    Ack: YES  (sent {0})  Subject: {1}" -f $sentLocal, $ack.Message.subject) -ForegroundColor Green
-                    } else {
-                        Write-Host "    Ack: NO" -ForegroundColor Yellow
-                    }
-                }
-                Write-Host ""
-            }
+            Show-EmailTable -Emails $recentToOnly -Title "TO-ONLY EMAILS FOR '$PrimaryRecipient' (Most Recent 50)" -ShowAck ($CheckAcks -match '^[Yy]') -SentCache $sentCache
         } else {
             Write-Host ("`n=== No emails where '{0}' is TO-only (no CC/BCC) ===" -f $PrimaryRecipient) -ForegroundColor DarkGray
+        }
+
+        # ACK Summary
+        if ($CheckAcks -match '^[Yy]') {
+            $ackYes = 0; $ackNo = 0
+            foreach ($email in $allEmails) {
+                $ack = Find-AckForInboundSameDay -InboundEmail $email -SentCache $sentCache
+                if ($ack.Acknowledged) { $ackYes++ } else { $ackNo++ }
+            }
+            
+            Write-Host "`n=== ACK SUMMARY ===" -ForegroundColor Green
+            Write-Host ("Acknowledged: {0}" -f $ackYes) -ForegroundColor Green
+            Write-Host ("Not acknowledged: {0}" -f $ackNo) -ForegroundColor Yellow
         }
     }
 
@@ -489,7 +526,7 @@ try {
         Write-Host "`n=== FINAL TOTALS ===" -ForegroundColor Green
         Write-Host ("Total emails: {0}" -f $totalEmails) -ForegroundColor Yellow
         Write-Host ("Total with '{0}' in To (any): {1}" -f $PrimaryRecipient, $toAnyCount) -ForegroundColor Yellow
-        Write-Host ("  …of which To-only (no CC/BCC): {0}" -f $toOnlyCount) -ForegroundColor Yellow
+        Write-Host ("  …of which To-only (no CC/BCC): {0}" -f $toOnlyCount) -ForegroundColor Green
 
         if ($CheckAcks -match '^[Yy]') {
             Write-Host ("Acknowledged (same-day To-only reply found): {0}" -f $ackTotalYes) -ForegroundColor Green
