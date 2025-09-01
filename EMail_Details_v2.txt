@@ -272,7 +272,7 @@ function Show-EmailTable {
         [Parameter(Mandatory=$true)] [array]$Emails,
         [string]$Title = "EMAIL DETAILS",
         [bool]$ShowAck = $false,
-        [array]$SentCache = @()
+        [array]$SentCache = $null
     )
     
     Write-Host "`n=== $Title ===" -ForegroundColor Green
@@ -310,6 +310,8 @@ function Show-EmailTable {
         if ($ShowAck -and $SentCache -and $SentCache.Count -gt 0) {
             $ack = Find-AckForInboundSameDay -InboundEmail $email -SentCache $SentCache
             $ackStatus = if ($ack.Acknowledged) { "YES" } else { "NO" }
+        } elseif ($ShowAck) {
+            $ackStatus = "NO"
         }
         
         $row = [PSCustomObject]@{
@@ -431,22 +433,26 @@ try {
         }
         
         # Apply filtering
-        $emailsToAny = $allEmails | Where-Object {
-            Test-RecipientContains -Recipients $_.toRecipients -Address $PrimaryRecipient
-        }
+        $emailsToAny = @()
+        $emailsToOnly = @()
+        $emailsToAlsoCcOrBcc = @()
         
-        # Fixed To-only filter - ensure we're properly checking for empty CC/BCC
-        $emailsToOnly = $allEmails | Where-Object {
-            $hasTo = Test-RecipientContains -Recipients $_.toRecipients -Address $PrimaryRecipient
-            $ccEmpty = (-not $_.ccRecipients) -or ($_.ccRecipients.Count -eq 0)
-            $bccEmpty = (-not $_.bccRecipients) -or ($_.bccRecipients.Count -eq 0)
+        foreach ($email in $allEmails) {
+            $hasTo = Test-RecipientContains -Recipients $email.toRecipients -Address $PrimaryRecipient
             
-            $hasTo -and $ccEmpty -and $bccEmpty
-        }
-        
-        $emailsToAlsoCcOrBcc = $allEmails | Where-Object {
-            (Test-RecipientContains -Recipients $_.toRecipients -Address $PrimaryRecipient) -and
-            ( ($_.ccRecipients -and $_.ccRecipients.Count -gt 0) -or ($_.bccRecipients -and $_.bccRecipients.Count -gt 0) )
+            if ($hasTo) {
+                $emailsToAny += $email
+                
+                # Check for CC/BCC
+                $ccCount = if ($email.ccRecipients) { $email.ccRecipients.Count } else { 0 }
+                $bccCount = if ($email.bccRecipients) { $email.bccRecipients.Count } else { 0 }
+                
+                if ($ccCount -eq 0 -and $bccCount -eq 0) {
+                    $emailsToOnly += $email
+                } else {
+                    $emailsToAlsoCcOrBcc += $email
+                }
+            }
         }
 
         Write-Host "`n=== FILTERING SUMMARY ===" -ForegroundColor Green
@@ -469,12 +475,14 @@ try {
 
         # Show all emails in table format
         $recentEmails = $allEmails | Sort-Object { [datetime]::Parse($_.receivedDateTime) } -Descending | Select-Object -First 50
-        Show-EmailTable -Emails $recentEmails -Title "ALL EMAILS (Most Recent 50)" -ShowAck ($CheckAcks -match '^[Yy]') -SentCache $sentCache
+        $showAckFlag = ($CheckAcks -match '^[Yy]') -and ($sentCache -ne $null) -and ($sentCache.Count -gt 0)
+        Show-EmailTable -Emails $recentEmails -Title "ALL EMAILS (Most Recent 50)" -ShowAck $showAckFlag -SentCache $sentCache
 
         # Show To-only emails in table format
         if ($emailsToOnly -and $emailsToOnly.Count -gt 0) {
             $recentToOnly = $emailsToOnly | Sort-Object { [datetime]::Parse($_.receivedDateTime) } -Descending | Select-Object -First 50
-            Show-EmailTable -Emails $recentToOnly -Title "TO-ONLY EMAILS FOR '$PrimaryRecipient' (Most Recent 50)" -ShowAck ($CheckAcks -match '^[Yy]') -SentCache $sentCache
+            $showAckFlag = ($CheckAcks -match '^[Yy]') -and ($sentCache -ne $null) -and ($sentCache.Count -gt 0)
+            Show-EmailTable -Emails $recentToOnly -Title "TO-ONLY EMAILS FOR '$PrimaryRecipient' (Most Recent 50)" -ShowAck $showAckFlag -SentCache $sentCache
         } else {
             Write-Host ("`n=== No emails where '{0}' is TO-only (no CC/BCC) ===" -f $PrimaryRecipient) -ForegroundColor DarkGray
         }
