@@ -490,9 +490,14 @@ try {
         # ACK Summary
         if ($CheckAcks -match '^[Yy]') {
             $ackYes = 0; $ackNo = 0
-            foreach ($email in $allEmails) {
-                $ack = Find-AckForInboundSameDay -InboundEmail $email -SentCache $sentCache
-                if ($ack.Acknowledged) { $ackYes++ } else { $ackNo++ }
+            if ($sentCache -ne $null -and $sentCache.Count -gt 0) {
+                foreach ($email in $allEmails) {
+                    $ack = Find-AckForInboundSameDay -InboundEmail $email -SentCache $sentCache
+                    if ($ack.Acknowledged) { $ackYes++ } else { $ackNo++ }
+                }
+            } else {
+                # No sent emails, so all are not acknowledged
+                $ackNo = $allEmails.Count
             }
             
             Write-Host "`n=== ACK SUMMARY ===" -ForegroundColor Green
@@ -518,10 +523,15 @@ try {
         # ACK totals across ALL inbound emails (same-day; To-only, no Cc/Bcc)
         $ackTotalYes = 0
         $ackTotalNo  = 0
-        if ($CheckAcks -match '^[Yy]' -and $sentCache -and $sentCache.Count -gt 0) {
-            foreach ($em in $allEmails) {
-                $ack = Find-AckForInboundSameDay -InboundEmail $em -SentCache $sentCache
-                if ($ack.Acknowledged) { $ackTotalYes++ } else { $ackTotalNo++ }
+        if ($CheckAcks -match '^[Yy]') {
+            if ($sentCache -ne $null -and $sentCache.Count -gt 0) {
+                foreach ($em in $allEmails) {
+                    $ack = Find-AckForInboundSameDay -InboundEmail $em -SentCache $sentCache
+                    if ($ack.Acknowledged) { $ackTotalYes++ } else { $ackTotalNo++ }
+                }
+            } else {
+                # No sent emails, so none are acknowledged
+                $ackTotalNo = $allEmails.Count
             }
         }
 
