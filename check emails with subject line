@@ -1,7 +1,5 @@
-# Email Subject Search Script with Optional Mark as Read
-# Searches for specific subject lines from Excel/CSV file in inbox_copy folder
-# Initial operation is read-only, then optionally marks selected emails as read
-# Requires: Azure AD app with Microsoft Graph Mail.Read and Mail.ReadWrite permissions
+# Diagnostic Script to Test Email Search Issues
+# This will help identify why emails aren't being found
 
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
@@ -49,431 +47,16 @@ function Get-FolderId {
     }
 }
 
-function Search-EmailBySubject {
-    param(
-        [Parameter(Mandatory=$true)] [string]$MailboxUPN,
-        [Parameter(Mandatory=$true)] [string]$Subject,
-        [Parameter(Mandatory=$true)] [datetime]$Date,
-        [Parameter(Mandatory=$true)] [hashtable]$Headers,
-        [Parameter(Mandatory=$true)] [string]$FolderId
-    )
-    
-    $baseUrl = "https://graph.microsoft.com/v1.0"
-    $encUser = [uri]::EscapeDataString($MailboxUPN)
-    
-    # Date range for the specific day
-    $startDate = $Date.Date.ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $endDate = $Date.Date.AddDays(1).ToString("yyyy-MM-ddTHH:mm:ssZ")
-    
-    # Escape special characters in subject for OData filter
-    $escapedSubject = $Subject -replace "'", "''"
-    
-    # Build filter for exact subject match and date range
-    $filter = "subject eq '$escapedSubject' and receivedDateTime ge $startDate and receivedDateTime lt $endDate"
-    $encFilter = [uri]::EscapeDataString($filter)
-    
-    # Select important fields
-    $encSelect = [uri]::EscapeDataString("id,subject,from,toRecipients,receivedDateTime,isRead,conversationId")
-    
-    # Use the provided folder ID
-    $uri = "$baseUrl/users/$encUser/mailFolders/$FolderId/messages?`$filter=$encFilter&`$select=$encSelect"
-    
-    try {
-        $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $Headers
-        return $response.value
-    } catch {
-        Write-Host "Error searching for subject '$Subject': $_" -ForegroundColor Red
-        return @()
-    }
-}
-
-function Mark-EmailAsRead {
-    param(
-        [Parameter(Mandatory=$true)] [string]$MailboxUPN,
-        [Parameter(Mandatory=$true)] [string]$MessageId,
-        [Parameter(Mandatory=$true)] [hashtable]$Headers
-    )
-    
-    $baseUrl = "https://graph.microsoft.com/v1.0"
-    $encUser = [uri]::EscapeDataString($MailboxUPN)
-    $uri = "$baseUrl/users/$encUser/messages/$MessageId"
-    
-    $body = @{
-        isRead = $true
-    } | ConvertTo-Json
-    
-    try {
-        $Headers["Content-Type"] = "application/json"
-        $response = Invoke-RestMethod -Method PATCH -Uri $uri -Headers $Headers -Body $body
-        return $true
-    } catch {
-        Write-Host "Error marking email as read: $_" -ForegroundColor Red
-        return $false
-    } finally {
-        # Remove Content-Type to avoid issues with other calls
-        $Headers.Remove("Content-Type")
-    }
-}
-
-function Load-SubjectsFromExcel {
-    param(
-        [Parameter(Mandatory=$true)] [string]$ExcelPath
-    )
-    
-    Write-Host "Attempting to read Excel file using COM objects..." -ForegroundColor Cyan
-    
-    $subjects = @()
-    $excel = $null
-    $workbook = $null
-    
-    try {
-        # Create Excel COM object
-        $excel = New-Object -ComObject Excel.Application
-        $excel.Visible = $false
-        $excel.DisplayAlerts = $false
-        
-        # Open workbook
-        $workbook = $excel.Workbooks.Open($ExcelPath)
-        $worksheet = $workbook.Worksheets.Item(1)
-        
-        # Get used range
-        $usedRange = $worksheet.UsedRange
-        $rowCount = $usedRange.Rows.Count
-        $colCount = $usedRange.Columns.Count
-        
-        Write-Host "Found $rowCount rows and $colCount columns in Excel file" -ForegroundColor Gray
-        
-        # Find subject column (look for header in first row)
-        $subjectCol = 1  # Default to first column
-        for ($col = 1; $col -le $colCount; $col++) {
-            $headerValue = $worksheet.Cells.Item(1, $col).Text
-            if ($headerValue -like "*subject*") {
-                $subjectCol = $col
-                Write-Host "Found 'Subject' column at position $col" -ForegroundColor Green
-                break
-            }
-        }
-        
-        if ($subjectCol -eq 1 -and $colCount -gt 1) {
-            Write-Host "No 'Subject' column found, using first column" -ForegroundColor Yellow
-        }
-        
-        # Read subjects (start from row 2 to skip header)
-        for ($row = 2; $row -le $rowCount; $row++) {
-            $cellValue = $worksheet.Cells.Item($row, $subjectCol).Text
-            if (![string]::IsNullOrWhiteSpace($cellValue)) {
-                $subjects += $cellValue.Trim()
-            }
-        }
-        
-        # Close workbook and quit Excel
-        $workbook.Close($false)
-        $excel.Quit()
-        
-        # Release COM objects
-        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($worksheet) | Out-Null
-        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($workbook) | Out-Null
-        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null
-        [System.GC]::Collect()
-        [System.GC]::WaitForPendingFinalizers()
-        
-        return $subjects | Select-Object -Unique
-        
-    } catch {
-        Write-Host "Error reading Excel file with COM: $_" -ForegroundColor Red
-        
-        # Cleanup on error
-        if ($workbook) { 
-            try { $workbook.Close($false) } catch {} 
-            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($workbook) | Out-Null
-        }
-        if ($excel) { 
-            try { $excel.Quit() } catch {} 
-            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null
-        }
-        [System.GC]::Collect()
-        [System.GC]::WaitForPendingFinalizers()
-        
-        throw
-    }
-}
-
-function Load-SubjectsFromCSV {
-    param(
-        [Parameter(Mandatory=$true)] [string]$CSVPath
-    )
-    
-    Write-Host "Reading CSV file..." -ForegroundColor Cyan
-    
-    try {
-        # Import CSV
-        $data = Import-Csv -Path $CSVPath
-        
-        if ($data.Count -eq 0) {
-            throw "CSV file is empty"
-        }
-        
-        # Find subject column
-        $columns = $data[0].PSObject.Properties.Name
-        $subjectColumn = $columns | Where-Object { $_ -like "*subject*" } | Select-Object -First 1
-        
-        if (!$subjectColumn) {
-            # Use first column if no "subject" column found
-            $subjectColumn = $columns[0]
-            Write-Host "No 'Subject' column found, using first column: '$subjectColumn'" -ForegroundColor Yellow
-        } else {
-            Write-Host "Using column: '$subjectColumn'" -ForegroundColor Green
-        }
-        
-        # Extract unique subjects
-        $subjects = $data | ForEach-Object { $_.$subjectColumn } | 
-                    Where-Object { ![string]::IsNullOrWhiteSpace($_) } |
-                    ForEach-Object { $_.Trim() } |
-                    Select-Object -Unique
-        
-        return $subjects
-        
-    } catch {
-        throw "Error reading CSV file: $_"
-    }
-}
-
-function Load-SubjectsFromFile {
-    param(
-        [Parameter(Mandatory=$true)] [string]$FilePath
-    )
-    
-    if (!(Test-Path $FilePath)) {
-        throw "File not found: $FilePath"
-    }
-    
-    $extension = [System.IO.Path]::GetExtension($FilePath).ToLower()
-    
-    switch ($extension) {
-        ".xlsx" {
-            # Try Excel COM object first
-            try {
-                return Load-SubjectsFromExcel -ExcelPath $FilePath
-            } catch {
-                Write-Host "Failed to read Excel file. Make sure Excel is installed." -ForegroundColor Red
-                Write-Host "Alternative: Save the file as CSV and try again." -ForegroundColor Yellow
-                throw
-            }
-        }
-        ".xls" {
-            # Try Excel COM object for old Excel format
-            try {
-                return Load-SubjectsFromExcel -ExcelPath $FilePath
-            } catch {
-                Write-Host "Failed to read Excel file. Make sure Excel is installed." -ForegroundColor Red
-                Write-Host "Alternative: Save the file as CSV and try again." -ForegroundColor Yellow
-                throw
-            }
-        }
-        ".csv" {
-            return Load-SubjectsFromCSV -CSVPath $FilePath
-        }
-        ".txt" {
-            # Read text file (one subject per line)
-            Write-Host "Reading text file..." -ForegroundColor Cyan
-            $subjects = Get-Content -Path $FilePath | 
-                        Where-Object { ![string]::IsNullOrWhiteSpace($_) } |
-                        ForEach-Object { $_.Trim() } |
-                        Select-Object -Unique
-            return $subjects
-        }
-        default {
-            throw "Unsupported file format: $extension. Please use .xlsx, .xls, .csv, or .txt"
-        }
-    }
-}
-
-function Show-ResultsSummary {
-    param(
-        [Parameter(Mandatory=$true)] [array]$Results
-    )
-    
-    Write-Host "`n=== SEARCH RESULTS SUMMARY ===" -ForegroundColor Green
-    Write-Host ("Total subjects searched: {0}" -f $Results.Count) -ForegroundColor White
-    
-    $found = $Results | Where-Object { $_.Found -eq $true }
-    $notFound = $Results | Where-Object { $_.Found -eq $false }
-    
-    Write-Host ("Found: {0}" -f $found.Count) -ForegroundColor Green
-    Write-Host ("Not found: {0}" -f $notFound.Count) -ForegroundColor Yellow
-    
-    # Calculate total emails found
-    $totalEmailsFound = 0
-    $unreadEmailsFound = 0
-    foreach ($result in $found) {
-        $totalEmailsFound += $result.Emails.Count
-        $unreadEmailsFound += ($result.Emails | Where-Object { $_.isRead -eq $false }).Count
-    }
-    Write-Host ("Total individual emails found: {0}" -f $totalEmailsFound) -ForegroundColor White
-    Write-Host ("Unread emails: {0}" -f $unreadEmailsFound) -ForegroundColor Yellow
-    
-    if ($found.Count -gt 0) {
-        Write-Host "`nFOUND EMAILS:" -ForegroundColor Green
-        $emailIndex = 1
-        foreach ($result in $found) {
-            Write-Host ("  ✓ Subject: {0}" -f $result.Subject) -ForegroundColor Green
-            foreach ($email in $result.Emails) {
-                $fromDisplay = if ($email.from -and $email.from.emailAddress) { 
-                    $email.from.emailAddress.address 
-                } else { 
-                    "<unknown>" 
-                }
-                $receivedTime = [datetime]::Parse($email.receivedDateTime).ToString("yyyy-MM-dd HH:mm:ss")
-                $readStatus = if ($email.isRead) { "Read" } else { "UNREAD" }
-                $statusColor = if ($email.isRead) { "Gray" } else { "Yellow" }
-                Write-Host ("      [{0}] From: {1} | Time: {2} | Status: {3}" -f $emailIndex, $fromDisplay, $receivedTime, $readStatus) -ForegroundColor $statusColor
-                $emailIndex++
-            }
-        }
-    }
-    
-    if ($notFound.Count -gt 0) {
-        Write-Host "`nNOT FOUND:" -ForegroundColor Yellow
-        foreach ($result in $notFound) {
-            Write-Host ("  ✗ {0}" -f $result.Subject) -ForegroundColor Yellow
-        }
-    }
-}
-
-function Select-EmailsToMark {
-    param(
-        [Parameter(Mandatory=$true)] [array]$UnreadEmails
-    )
-    
-    Write-Host "`n=== SELECT EMAILS TO MARK AS READ ===" -ForegroundColor Cyan
-    Write-Host "Total unread emails: $($UnreadEmails.Count)" -ForegroundColor Yellow
-    
-    # Display unread emails with numbers
-    Write-Host "`nUnread emails:" -ForegroundColor White
-    for ($i = 0; $i -lt $UnreadEmails.Count; $i++) {
-        $email = $UnreadEmails[$i]
-        $fromDisplay = if ($email.from -and $email.from.emailAddress) { 
-            $email.from.emailAddress.address 
-        } else { 
-            "<unknown>" 
-        }
-        $receivedTime = [datetime]::Parse($email.receivedDateTime).ToString("yyyy-MM-dd HH:mm:ss")
-        Write-Host ("[{0}] Subject: {1}" -f ($i + 1), $email.subject) -ForegroundColor Yellow
-        Write-Host ("     From: {0} | Time: {1}" -f $fromDisplay, $receivedTime) -ForegroundColor Gray
-    }
-    
-    Write-Host "`nOptions:" -ForegroundColor Cyan
-    Write-Host "  A - Mark ALL unread emails as read" -ForegroundColor White
-    Write-Host "  S - Select specific emails to mark" -ForegroundColor White
-    Write-Host "  N - Don't mark any emails" -ForegroundColor White
-    
-    $choice = Read-Host "`nYour choice (A/S/N)"
-    
-    switch ($choice.ToUpper()) {
-        "A" {
-            return $UnreadEmails
-        }
-        "S" {
-            Write-Host "`nEnter email numbers to mark as read (comma-separated, e.g., 1,3,5):" -ForegroundColor Cyan
-            $selection = Read-Host "Email numbers"
-            
-            $selectedEmails = @()
-            $numbers = $selection -split ',' | ForEach-Object { $_.Trim() }
-            
-            foreach ($num in $numbers) {
-                if ($num -match '^\d+$') {
-                    $index = [int]$num - 1
-                    if ($index -ge 0 -and $index -lt $UnreadEmails.Count) {
-                        $selectedEmails += $UnreadEmails[$index]
-                    } else {
-                        Write-Host "Invalid number: $num (out of range)" -ForegroundColor Red
-                    }
-                } else {
-                    Write-Host "Invalid input: $num (not a number)" -ForegroundColor Red
-                }
-            }
-            
-            if ($selectedEmails.Count -gt 0) {
-                Write-Host "`nSelected $($selectedEmails.Count) email(s) to mark as read" -ForegroundColor Green
-            }
-            
-            return $selectedEmails
-        }
-        "N" {
-            return @()
-        }
-        default {
-            Write-Host "Invalid choice. No emails will be marked." -ForegroundColor Yellow
-            return @()
-        }
-    }
-}
-
-# ========== MAIN SCRIPT ==========
-Write-Host "=== Email Subject Search Tool (inbox_copy) ===" -ForegroundColor Cyan
-Write-Host "This tool searches for specific email subjects from a file" -ForegroundColor White
-Write-Host "in the 'inbox_copy' folder (read-only initially, with option to mark as read)" -ForegroundColor White
+Write-Host "=== EMAIL SEARCH DIAGNOSTIC TOOL ===" -ForegroundColor Cyan
+Write-Host "This tool will help diagnose why emails aren't being found" -ForegroundColor Yellow
 Write-Host ""
-
-# Supported file formats
-Write-Host "Supported file formats:" -ForegroundColor Yellow
-Write-Host "  • Excel files (.xlsx, .xls) - Requires Excel installed" -ForegroundColor Gray
-Write-Host "  • CSV files (.csv) - Works without Excel" -ForegroundColor Gray
-Write-Host "  • Text files (.txt) - One subject per line" -ForegroundColor Gray
-Write-Host ""
-
-Write-Host "Example file paths:" -ForegroundColor Yellow
-Write-Host "  Windows: C:\Users\YourName\Documents\subjects.xlsx" -ForegroundColor Gray
-Write-Host "  CSV:     C:\Users\YourName\Documents\subjects.csv" -ForegroundColor Gray
-Write-Host "  Text:    .\subjects.txt (current directory)" -ForegroundColor Gray
-Write-Host ""
-
-# Get file path
-$FilePath = Read-Host "Enter path to file containing subject lines"
-
-# Load subjects from file
-Write-Host "`nLoading subjects from file..." -ForegroundColor Cyan
-try {
-    $subjects = Load-SubjectsFromFile -FilePath $FilePath
-    
-    if ($subjects.Count -eq 0) {
-        Write-Host "No subjects found in file!" -ForegroundColor Red
-        exit
-    }
-    
-    Write-Host ("Loaded {0} unique subject(s)" -f $subjects.Count) -ForegroundColor Green
-    
-    # Display loaded subjects
-    Write-Host "`nSubjects to search:" -ForegroundColor Cyan
-    $i = 1
-    foreach ($subject in $subjects) {
-        Write-Host ("  {0}. {1}" -f $i, $subject) -ForegroundColor White
-        $i++
-    }
-} catch {
-    Write-Host "Error: $_" -ForegroundColor Red
-    exit
-}
 
 # Get credentials
-Write-Host "`n=== AUTHENTICATION ===" -ForegroundColor Cyan
-$TenantId = Read-Host "Enter Tenant ID (GUID)"
-$ClientId = Read-Host "Enter Client ID (App ID)"
+Write-Host "=== AUTHENTICATION ===" -ForegroundColor Cyan
+$TenantId = Read-Host "Enter Tenant ID"
+$ClientId = Read-Host "Enter Client ID"
 $ClientSecret = Read-Host "Enter Client Secret" -AsSecureString
-$MailboxUPN = Read-Host "Enter mailbox UPN/email to search"
-
-# Get date to search
-$DateInput = Read-Host "Enter date to search (YYYY-MM-DD format, or press Enter for today)"
-if ([string]::IsNullOrWhiteSpace($DateInput)) {
-    $SearchDate = Get-Date
-} else {
-    try {
-        $SearchDate = [datetime]::ParseExact($DateInput, "yyyy-MM-dd", $null)
-    } catch {
-        Write-Host "Invalid date format. Using today's date." -ForegroundColor Yellow
-        $SearchDate = Get-Date
-    }
-}
+$MailboxUPN = Read-Host "Enter mailbox UPN/email"
 
 Write-Host "`nAuthenticating..." -ForegroundColor Cyan
 try {
@@ -485,142 +68,123 @@ try {
     exit
 }
 
-# Get inbox_copy folder ID
+# Get folder ID
 Write-Host "`nFinding 'inbox_copy' folder..." -ForegroundColor Cyan
 try {
     $folderId = Get-FolderId -MailboxUPN $MailboxUPN -FolderName "inbox_copy" -Headers $headers
-    Write-Host "Found 'inbox_copy' folder!" -ForegroundColor Green
+    Write-Host "Found folder with ID: $folderId" -ForegroundColor Green
 } catch {
     Write-Host "Error: $_" -ForegroundColor Red
     exit
 }
 
-# Search for each subject
-Write-Host "`n=== SEARCHING FOR EMAILS (READ-ONLY) ===" -ForegroundColor Cyan
-Write-Host ("Searching in: inbox_copy") -ForegroundColor White
-Write-Host ("Date: {0}" -f $SearchDate.ToString("yyyy-MM-dd")) -ForegroundColor White
-Write-Host ""
+Write-Host "`n=== DIAGNOSTIC TESTS ===" -ForegroundColor Cyan
 
-$searchResults = @()
-$foundEmails = @()
+# Test 1: Get ALL emails from the folder (no filter)
+Write-Host "`nTEST 1: Getting first 10 emails from inbox_copy (no filters)..." -ForegroundColor Yellow
+$baseUrl = "https://graph.microsoft.com/v1.0"
+$encUser = [uri]::EscapeDataString($MailboxUPN)
+$uri = "$baseUrl/users/$encUser/mailFolders/$folderId/messages?`$top=10&`$select=subject,receivedDateTime"
 
-foreach ($subject in $subjects) {
-    Write-Host ("Searching for: {0}" -f $subject) -NoNewline
-    
-    $emails = Search-EmailBySubject -MailboxUPN $MailboxUPN -Subject $subject -Date $SearchDate -Headers $headers -FolderId $folderId
-    
-    if ($emails -and $emails.Count -gt 0) {
-        Write-Host " ... FOUND ({0} email(s))" -ForegroundColor Green -f $emails.Count
-        $searchResults += [PSCustomObject]@{
-            Subject = $subject
-            Found = $true
-            Emails = $emails
+try {
+    $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+    if ($response.value -and $response.value.Count -gt 0) {
+        Write-Host "Found $($response.value.Count) emails:" -ForegroundColor Green
+        foreach ($email in $response.value) {
+            $date = [datetime]::Parse($email.receivedDateTime).ToString("yyyy-MM-dd HH:mm")
+            Write-Host "  - Date: $date | Subject: $($email.subject)" -ForegroundColor White
         }
-        $foundEmails += $emails
     } else {
-        Write-Host " ... NOT FOUND" -ForegroundColor Yellow
-        $searchResults += [PSCustomObject]@{
-            Subject = $subject
-            Found = $false
-            Emails = @()
-        }
+        Write-Host "No emails found in folder!" -ForegroundColor Red
     }
+} catch {
+    Write-Host "Error: $_" -ForegroundColor Red
 }
 
-# Show summary
-Show-ResultsSummary -Results $searchResults
+# Test 2: Search with simple partial text
+Write-Host "`nTEST 2: Testing simple partial search..." -ForegroundColor Yellow
+$testSearch = Read-Host "Enter a simple search term (e.g., '097-0136361' or 'Servicing Request')"
 
-# Mark as read if any emails were found
-if ($foundEmails.Count -gt 0) {
-    # Count unread emails
-    $unreadEmails = $foundEmails | Where-Object { $_.isRead -eq $false }
-    
-    if ($unreadEmails.Count -eq 0) {
-        Write-Host "`nAll found emails are already marked as read." -ForegroundColor Green
+$escapedSearch = $testSearch -replace "'", "''"
+$filter = "contains(subject, '$escapedSearch')"
+$encFilter = [uri]::EscapeDataString($filter)
+$uri = "$baseUrl/users/$encUser/mailFolders/$folderId/messages?`$filter=$encFilter&`$select=subject,receivedDateTime"
+
+Write-Host "Using filter: contains(subject, '$escapedSearch')" -ForegroundColor Gray
+
+try {
+    $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+    if ($response.value -and $response.value.Count -gt 0) {
+        Write-Host "Found $($response.value.Count) matching emails:" -ForegroundColor Green
+        foreach ($email in $response.value) {
+            $date = [datetime]::Parse($email.receivedDateTime).ToString("yyyy-MM-dd HH:mm")
+            Write-Host "  - Date: $date | Subject: $($email.subject)" -ForegroundColor White
+        }
     } else {
-        Write-Host "`n=== MARK AS READ OPTION ===" -ForegroundColor Cyan
-        Write-Host ("Found {0} unread email(s) out of {1} total" -f $unreadEmails.Count, $foundEmails.Count) -ForegroundColor Yellow
-        
-        $markAsRead = Read-Host "`nDo you want to mark emails as read? (Y/N)"
-        
-        if ($markAsRead -match '^[Yy]') {
-            # Select which emails to mark
-            $emailsToMark = Select-EmailsToMark -UnreadEmails $unreadEmails
-            
-            if ($emailsToMark.Count -gt 0) {
-                Write-Host "`nMarking $($emailsToMark.Count) email(s) as read..." -ForegroundColor Cyan
-                
-                $successCount = 0
-                $failCount = 0
-                
-                foreach ($email in $emailsToMark) {
-                    $subject = $email.subject
-                    Write-Host ("  Marking: {0}" -f $subject) -NoNewline
-                    
-                    if (Mark-EmailAsRead -MailboxUPN $MailboxUPN -MessageId $email.id -Headers $headers) {
-                        Write-Host " ... SUCCESS" -ForegroundColor Green
-                        $successCount++
-                    } else {
-                        Write-Host " ... FAILED" -ForegroundColor Red
-                        $failCount++
-                    }
-                }
-                
-                Write-Host "`nMark as read complete:" -ForegroundColor Cyan
-                Write-Host ("  Successful: {0}" -f $successCount) -ForegroundColor Green
-                if ($failCount -gt 0) {
-                    Write-Host ("  Failed: {0}" -f $failCount) -ForegroundColor Red
-                }
-            } else {
-                Write-Host "No emails selected to mark as read." -ForegroundColor Yellow
-            }
-        } else {
-            Write-Host "Emails not marked as read." -ForegroundColor Yellow
-        }
+        Write-Host "No emails found with this search term!" -ForegroundColor Red
     }
-} else {
-    Write-Host "`nNo emails found to mark as read." -ForegroundColor Yellow
+} catch {
+    Write-Host "Error: $_" -ForegroundColor Red
 }
 
-# Export results to CSV
-$exportResults = Read-Host "`nDo you want to export results to CSV? (Y/N)"
-if ($exportResults -match '^[Yy]') {
-    $csvPath = [System.IO.Path]::GetDirectoryName($FilePath)
-    if ([string]::IsNullOrWhiteSpace($csvPath)) { $csvPath = Get-Location }
-    $csvFileName = "EmailSearchResults_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-    $csvFullPath = [System.IO.Path]::Combine($csvPath, $csvFileName)
+# Test 3: Test date filtering
+Write-Host "`nTEST 3: Testing date filter..." -ForegroundColor Yellow
+$dateInput = Read-Host "Enter a date (YYYY-MM-DD) to test"
+try {
+    $testDate = [datetime]::ParseExact($dateInput, "yyyy-MM-dd", $null)
+    $startDate = $testDate.Date.ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $endDate = $testDate.Date.AddDays(1).ToString("yyyy-MM-ddTHH:mm:ssZ")
     
-    $exportData = @()
-    foreach ($result in $searchResults) {
-        if ($result.Found) {
-            foreach ($email in $result.Emails) {
-                $exportData += [PSCustomObject]@{
-                    SearchSubject = $result.Subject
-                    Found = "Yes"
-                    EmailSubject = $email.subject
-                    From = if ($email.from -and $email.from.emailAddress) { $email.from.emailAddress.address } else { "<unknown>" }
-                    ReceivedTime = [datetime]::Parse($email.receivedDateTime).ToString("yyyy-MM-dd HH:mm:ss")
-                    IsRead = $email.isRead
-                    MessageId = $email.id
-                }
-            }
-        } else {
-            $exportData += [PSCustomObject]@{
-                SearchSubject = $result.Subject
-                Found = "No"
-                EmailSubject = ""
-                From = ""
-                ReceivedTime = ""
-                IsRead = ""
-                MessageId = ""
-            }
+    Write-Host "Searching from $startDate to $endDate" -ForegroundColor Gray
+    
+    $filter = "receivedDateTime ge $startDate and receivedDateTime lt $endDate"
+    $encFilter = [uri]::EscapeDataString($filter)
+    $uri = "$baseUrl/users/$encUser/mailFolders/$folderId/messages?`$filter=$encFilter&`$select=subject,receivedDateTime"
+    
+    $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+    if ($response.value -and $response.value.Count -gt 0) {
+        Write-Host "Found $($response.value.Count) emails on this date:" -ForegroundColor Green
+        foreach ($email in $response.value) {
+            $date = [datetime]::Parse($email.receivedDateTime).ToString("yyyy-MM-dd HH:mm:ss")
+            Write-Host "  - Time: $date | Subject: $($email.subject)" -ForegroundColor White
         }
+    } else {
+        Write-Host "No emails found on this date!" -ForegroundColor Red
     }
-    
-    $exportData | Export-Csv -Path $csvFullPath -NoTypeInformation
-    Write-Host ("Results exported to: {0}" -f $csvFullPath) -ForegroundColor Green
+} catch {
+    Write-Host "Error: $_" -ForegroundColor Red
 }
 
-Write-Host "`n=== SEARCH COMPLETE ===" -ForegroundColor Green
-Write-Host "Initial search was read-only (Mail.Read permission)" -ForegroundColor Yellow
-Write-Host "Mark as read requires Mail.ReadWrite permissions" -ForegroundColor Yellow
+# Test 4: Test with exact text from Excel
+Write-Host "`nTEST 4: Test with exact text from your Excel..." -ForegroundColor Yellow
+Write-Host "Copy and paste EXACTLY what's in your Excel cell (including ... if present):" -ForegroundColor Cyan
+$exactText = Read-Host "Paste exact text"
+
+$escapedExact = $exactText -replace "'", "''"
+$filter = "contains(subject, '$escapedExact')"
+$encFilter = [uri]::EscapeDataString($filter)
+$uri = "$baseUrl/users/$encUser/mailFolders/$folderId/messages?`$filter=$encFilter&`$select=subject,receivedDateTime"
+
+Write-Host "Searching for: '$escapedExact'" -ForegroundColor Gray
+
+try {
+    $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+    if ($response.value -and $response.value.Count -gt 0) {
+        Write-Host "Found $($response.value.Count) matching emails!" -ForegroundColor Green
+        foreach ($email in $response.value) {
+            Write-Host "  - Subject: $($email.subject)" -ForegroundColor White
+        }
+    } else {
+        Write-Host "Not found. The text in Excel might be truncated." -ForegroundColor Red
+        Write-Host "Try using a shorter search term from the middle of the subject." -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "Error: $_" -ForegroundColor Red
+}
+
+Write-Host "`n=== DIAGNOSTIC COMPLETE ===" -ForegroundColor Green
+Write-Host "Based on the results above, you can identify:" -ForegroundColor Yellow
+Write-Host "1. Whether emails exist in the folder" -ForegroundColor White
+Write-Host "2. The exact format of dates in the emails" -ForegroundColor White
+Write-Host "3. Whether partial search is working" -ForegroundColor White
+Write-Host "4. Whether your Excel contains truncated text" -ForegroundColor White
