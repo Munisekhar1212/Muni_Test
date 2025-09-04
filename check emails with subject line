@@ -623,4 +623,4 @@ if ($exportResults -match '^[Yy]') {
 
 Write-Host "`n=== SEARCH COMPLETE ===" -ForegroundColor Green
 Write-Host "Initial search was read-only (Mail.Read permission)" -ForegroundColor Yellow
-Write-Host "Mark as read requires Mail.ReadWrite permission" -ForegroundColor Yellow
+Write-Host "Mark as read requires Mail.ReadWrite permissions" -ForegroundColor Yellow
