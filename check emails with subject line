@@ -516,19 +516,38 @@ try {
 # Search for each subject
 Write-Host "`n=== SEARCHING FOR EMAILS (READ-ONLY) ===" -ForegroundColor Cyan
 Write-Host ("Searching in: inbox_copy") -ForegroundColor White
-Write-Host ("Date: {0}" -f $SearchDate.ToString("yyyy-MM-dd")) -ForegroundColor White
+if ($NoDateFilter) {
+    Write-Host "Date filter: ALL DATES" -ForegroundColor Yellow
+} else {
+    Write-Host ("Date filter: {0}" -f $SearchDate.ToString("yyyy-MM-dd")) -ForegroundColor White
+}
 Write-Host ""
 
 $searchResults = @()
 $foundEmails = @()
 
 foreach ($subject in $subjects) {
-    Write-Host ("Searching for: {0}" -f $subject) -NoNewline
+    Write-Host ("Searching for: {0}" -f $subject) -ForegroundColor White
     
-    $emails = Search-EmailBySubject -MailboxUPN $MailboxUPN -Subject $subject -Date $SearchDate -Headers $headers -FolderId $folderId
+    if ($NoDateFilter) {
+        $emails = Search-EmailBySubject -MailboxUPN $MailboxUPN -Subject $subject -Headers $headers -FolderId $folderId -NoDateFilter $true
+    } else {
+        $emails = Search-EmailBySubject -MailboxUPN $MailboxUPN -Subject $subject -Date $SearchDate -Headers $headers -FolderId $folderId -NoDateFilter $false
+    }
     
     if ($emails -and $emails.Count -gt 0) {
-        Write-Host " ... FOUND ({0} email(s))" -ForegroundColor Green -f $emails.Count
+        Write-Host "  ✓ FOUND ({0} email(s))" -ForegroundColor Green -f $emails.Count
+        # Show actual subjects found for verification (limit to first 3)
+        $showCount = [Math]::Min(3, $emails.Count)
+        for ($i = 0; $i -lt $showCount; $i++) {
+            $email = $emails[$i]
+            $receivedDate = [datetime]::Parse($email.receivedDateTime).ToString("yyyy-MM-dd HH:mm")
+            Write-Host ("    → Date: {0} | Subject: {1}" -f $receivedDate, $email.subject) -ForegroundColor DarkGray
+        }
+        if ($emails.Count -gt 3) {
+            Write-Host ("    ... and {0} more emails" -f ($emails.Count - 3)) -ForegroundColor DarkGray
+        }
+        
         $searchResults += [PSCustomObject]@{
             Subject = $subject
             Found = $true
@@ -536,7 +555,7 @@ foreach ($subject in $subjects) {
         }
         $foundEmails += $emails
     } else {
-        Write-Host " ... NOT FOUND" -ForegroundColor Yellow
+        Write-Host "  ✗ NOT FOUND" -ForegroundColor Yellow
         $searchResults += [PSCustomObject]@{
             Subject = $subject
             Found = $false
